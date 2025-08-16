@@ -44,14 +44,28 @@ function convertDriverError(error: Error): any {
     const code = (error as any).code
 
     // Map SQLite error codes to Prisma error kinds
-    if (code === SQLite.SQLITE_CONSTRAINT) {
+    if (code === SQLite.SQLITE_CONSTRAINT || code === SQLite.SQLITE_CONSTRAINT_UNIQUE) {
+      // Check if it's a unique constraint violation
+      if (error.message.includes('UNIQUE') || error.message.includes('duplicate')) {
+        return {
+          kind: 'UniqueConstraintViolation',
+          message: error.message,
+        }
+      }
+      // Check if it's a foreign key constraint
+      if (error.message.includes('FOREIGN KEY')) {
+        return {
+          kind: 'ForeignKeyConstraintViolation',
+          message: error.message,
+        }
+      }
       return {
-        kind: 'UniqueConstraintViolation',
+        kind: 'ConstraintViolation',
         message: error.message,
       }
     }
 
-    if (code === SQLite.SQLITE_BUSY) {
+    if (code === SQLite.SQLITE_BUSY || code === SQLite.SQLITE_LOCKED) {
       return {
         kind: 'DatabaseTimeout',
         message: error.message,
@@ -69,6 +83,10 @@ function getColumnTypeEnums(columnNames: string[], rows: unknown[][]): Record<st
   const columnTypes: Record<string, ColumnTypeEnum> = {}
 
   if (rows.length === 0) {
+    // Default all columns to Text when no rows
+    columnNames.forEach(name => {
+      columnTypes[name] = ColumnTypeEnum.Text
+    })
     return columnTypes
   }
 
@@ -81,7 +99,7 @@ function getColumnTypeEnums(columnNames: string[], rows: unknown[][]): Record<st
     const value = firstRow[index]
     // Map to Prisma ColumnTypeEnum
     if (value === null || value === undefined) {
-      columnTypes[name] = ColumnTypeEnum.Int32 // Default for NULL
+      columnTypes[name] = ColumnTypeEnum.Text // Default for NULL
     } else if (typeof value === 'number') {
       if (Number.isInteger(value)) {
         columnTypes[name] = ColumnTypeEnum.Int32
@@ -161,9 +179,11 @@ class WaSQLiteQueryable implements SqlQueryable {
     const [columnNames, results] = ioResult
 
     if (results.length === 0) {
+      // Still return column names even when no rows
+      const columnTypes = Object.values(getColumnTypeEnums(columnNames, results))
       return {
-        columnNames: [],
-        columnTypes: [],
+        columnNames,
+        columnTypes,
         rows: [],
       }
     }
@@ -190,8 +210,11 @@ class WaSQLiteQueryable implements SqlQueryable {
     return result as number
   }
 
-  private async performIO(query: SqlQuery, executeRaw = false): Promise<[string[], unknown[][]] | number> {
+  protected async performIO(query: SqlQuery, executeRaw = false): Promise<[string[], unknown[][]] | number> {
     const { sqlite3, db } = this.adapter
+
+    console.log('[performIO] SQL:', query.sql)
+    console.log('[performIO] Args:', query.args)
 
     try {
       // Clean arguments
@@ -334,72 +357,21 @@ class WaSQLiteQueryable implements SqlQueryable {
  * wa-sqlite Transaction implementation  
  */
 class WaSQLiteTransaction extends WaSQLiteQueryable implements Transaction {
-  private state: 'open' | 'committed' | 'rolledback' = 'open'
-  
   constructor(
     adapter: WaSQLiteAdapter, 
-    readonly options: TransactionOptions,
-    private readonly isNested: boolean = false
+    readonly options: TransactionOptions
   ) {
     super(adapter)
   }
 
   async commit(): Promise<void> {
-    debug(`[js::commit] state: ${this.state}, isNested: ${this.isNested}`)
-    
-    // If already processed, return silently (idempotent)
-    if (this.state !== 'open') {
-      debug(`[js::commit] Transaction already ${this.state}`)
-      return
-    }
-
-    const { sqlite3, db } = this.adapter
-    
-    // Only actually commit if this is not a nested transaction
-    // For nested transactions, we just mark as committed but don't execute DB commands
-    if (!this.isNested) {
-      // Check if there's actually a transaction to commit
-      try {
-        await sqlite3.exec(db, 'COMMIT')
-      } catch (error: any) {
-        // If there's no transaction to commit, that's fine - it might have been
-        // committed by another transaction object
-        if (!error?.message?.includes('no transaction is active')) {
-          throw error
-        }
-      }
-    }
-    
-    this.state = 'committed'
+    debug(`[js::commit]`)
+    // Commit handled by adapter
   }
 
   async rollback(): Promise<void> {
-    debug(`[js::rollback] state: ${this.state}, isNested: ${this.isNested}`)
-    
-    // If already processed, return silently (idempotent)
-    if (this.state !== 'open') {
-      debug(`[js::rollback] Transaction already ${this.state}`)
-      return
-    }
-
-    const { sqlite3, db } = this.adapter
-    
-    // Only actually rollback if this is not a nested transaction
-    // For nested transactions, we just mark as rolled back but don't execute DB commands
-    if (!this.isNested) {
-      // Check if there's actually a transaction to rollback
-      try {
-        await sqlite3.exec(db, 'ROLLBACK')
-      } catch (error: any) {
-        // If there's no transaction to rollback, that's fine - it might have been
-        // committed or rolled back by another transaction object
-        if (!error?.message?.includes('no transaction is active')) {
-          throw error
-        }
-      }
-    }
-    
-    this.state = 'rolledback'
+    debug(`[js::rollback]`)
+    // Rollback handled by adapter
   }
 }
 
@@ -415,8 +387,8 @@ export class PrismaWaSQLiteAdapter extends WaSQLiteQueryable implements SqlDrive
     query: '[prisma:query]',
   }
   
-  private transactionCount = 0
-  private hasActiveTransaction = false
+  private transactionDepth = 0
+  private activeTransaction: WaSQLiteTransaction | null = null
 
   constructor(adapter: WaSQLiteAdapter, private readonly release?: () => Promise<void>) {
     super(adapter)
@@ -425,10 +397,10 @@ export class PrismaWaSQLiteAdapter extends WaSQLiteQueryable implements SqlDrive
   async executeScript(script: string): Promise<void> {
     try {
       const { sqlite3, db } = this.adapter
-      // console.log('[wa-sqlite] Executing script:', script.substring(0, 100), '...')
+      debug('[wa-sqlite] Executing script:', script.substring(0, 100), '...')
       await sqlite3.exec(db, script)
     } catch (error) {
-      // console.error('[wa-sqlite] Error executing script:', error)
+      console.error('[wa-sqlite] Error executing script:', error)
       onError(error as Error)
     }
   }
@@ -453,50 +425,99 @@ export class PrismaWaSQLiteAdapter extends WaSQLiteQueryable implements SqlDrive
     }
 
     const tag = '[js::startTransaction]'
-    debug('%s options: %O', tag, options)
+    debug('%s depth: %d, options: %O', tag, this.transactionDepth, options)
 
     const { sqlite3, db } = this.adapter
     
-    // Track if this is a nested transaction
-    const isNested = this.hasActiveTransaction
-    
-    if (!isNested) {
-      // Start a new database transaction
-      await sqlite3.exec(db, 'BEGIN')
-      this.hasActiveTransaction = true
-      this.transactionCount = 1
+    // Simple transaction handling - Prisma will manage nested transactions
+    if (this.transactionDepth === 0) {
+      try {
+        await sqlite3.exec(db, 'BEGIN')
+        this.transactionDepth = 1
+      } catch (error: any) {
+        // If BEGIN fails, it might be because a transaction is already active
+        // This can happen with Prisma's transaction management
+        if (!error?.message?.includes('cannot start a transaction within a transaction')) {
+          throw error
+        }
+        this.transactionDepth = 1
+      }
     } else {
-      // This is a nested transaction request
-      this.transactionCount++
+      // Nested transaction - use savepoint
+      this.transactionDepth++
+      const savepointName = `sp_${this.transactionDepth}`
+      try {
+        await sqlite3.exec(db, `SAVEPOINT ${savepointName}`)
+      } catch (error: any) {
+        console.warn(`Failed to create savepoint ${savepointName}:`, error)
+      }
     }
     
-    // Create transaction object that knows if it's nested
-    const tx = new WaSQLiteTransaction(this.adapter, options, isNested)
+    const currentDepth = this.transactionDepth
+    const tx = new WaSQLiteTransaction(this.adapter, options)
     
-    // Track when transactions complete
-    const originalCommit = tx.commit.bind(tx)
-    const originalRollback = tx.rollback.bind(tx)
-    
+    // Override commit and rollback
     tx.commit = async () => {
-      await originalCommit()
-      this.transactionCount--
-      if (this.transactionCount === 0) {
-        this.hasActiveTransaction = false
+      debug(`${tag} Committing at depth ${currentDepth}`)
+      if (currentDepth === 1) {
+        try {
+          await sqlite3.exec(db, 'COMMIT')
+        } catch (error: any) {
+          if (!error?.message?.includes('no transaction is active')) {
+            throw error
+          }
+        }
+        this.transactionDepth = 0
+      } else if (currentDepth > 1) {
+        const savepointName = `sp_${currentDepth}`
+        try {
+          await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
+        } catch (error: any) {
+          console.warn(`Failed to release savepoint ${savepointName}:`, error)
+        }
+        this.transactionDepth--
       }
     }
     
     tx.rollback = async () => {
-      await originalRollback()
-      this.transactionCount--
-      if (this.transactionCount === 0) {
-        this.hasActiveTransaction = false
+      debug(`${tag} Rolling back at depth ${currentDepth}`)
+      if (currentDepth === 1) {
+        try {
+          await sqlite3.exec(db, 'ROLLBACK')
+        } catch (error: any) {
+          if (!error?.message?.includes('no transaction is active')) {
+            throw error
+          }
+        }
+        this.transactionDepth = 0
+      } else if (currentDepth > 1) {
+        const savepointName = `sp_${currentDepth}`
+        try {
+          await sqlite3.exec(db, `ROLLBACK TO SAVEPOINT ${savepointName}`)
+          await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
+        } catch (error: any) {
+          console.warn(`Failed to rollback savepoint ${savepointName}:`, error)
+        }
+        this.transactionDepth--
       }
     }
     
+    this.activeTransaction = tx
     return tx
   }
 
   async dispose(): Promise<void> {
+    // Ensure any open transaction is rolled back
+    if (this.transactionDepth > 0) {
+      const { sqlite3, db } = this.adapter
+      try {
+        await sqlite3.exec(db, 'ROLLBACK')
+      } catch (error) {
+        // Ignore errors during cleanup
+      }
+      this.transactionDepth = 0
+    }
+    
     await this.release?.()
   }
 }
@@ -562,9 +583,11 @@ export const createWaSQLitePrismaAdapter = async (
     // Set pragmas for better performance and compatibility
     try {
       await sqlite3.exec(db, 'PRAGMA foreign_keys = ON')
+      // WAL mode is not supported in memory databases
+      // await sqlite3.exec(db, 'PRAGMA journal_mode = WAL')
       options?.logger?.('Foreign keys enabled')
     } catch (e) {
-      console.warn('[wa-sqlite] Failed to enable foreign keys:', e)
+      console.warn('[wa-sqlite] Failed to set pragmas:', e)
     }
 
     // Test the connection with a simple query
