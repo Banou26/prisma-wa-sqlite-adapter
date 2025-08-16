@@ -1,0 +1,6 @@
+node_modules
+test-results
+build
+prisma/migrations
+prisma/dev.db
+src/generated
