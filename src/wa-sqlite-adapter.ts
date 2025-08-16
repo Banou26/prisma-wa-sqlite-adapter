@@ -39,6 +39,8 @@ function cleanArg(arg: unknown, argType?: unknown): unknown {
 }
 
 function convertDriverError(error: Error): any {
+  const errorMessage = error.message || ''
+  
   // Check if it's a SQLiteError with a code
   if ('code' in error && typeof (error as any).code === 'number') {
     const code = (error as any).code
@@ -46,36 +48,51 @@ function convertDriverError(error: Error): any {
     // Map SQLite error codes to Prisma error kinds
     if (code === SQLite.SQLITE_CONSTRAINT || code === SQLite.SQLITE_CONSTRAINT_UNIQUE) {
       // Check if it's a unique constraint violation
-      if (error.message.includes('UNIQUE') || error.message.includes('duplicate')) {
+      if (errorMessage.includes('UNIQUE') || errorMessage.includes('duplicate')) {
         return {
           kind: 'UniqueConstraintViolation',
-          message: error.message,
+          message: errorMessage,
         }
       }
       // Check if it's a foreign key constraint
-      if (error.message.includes('FOREIGN KEY')) {
+      if (errorMessage.includes('FOREIGN KEY')) {
         return {
           kind: 'ForeignKeyConstraintViolation',
-          message: error.message,
+          message: errorMessage,
         }
       }
       return {
         kind: 'ConstraintViolation',
-        message: error.message,
+        message: errorMessage,
       }
     }
 
     if (code === SQLite.SQLITE_BUSY || code === SQLite.SQLITE_LOCKED) {
       return {
         kind: 'DatabaseTimeout',
-        message: error.message,
+        message: errorMessage,
       }
+    }
+  }
+
+  // Check for transaction errors in message
+  if (errorMessage.includes('no transaction is active')) {
+    return {
+      kind: 'TransactionAlreadyClosed',
+      message: errorMessage,
+    }
+  }
+
+  if (errorMessage.includes('cannot start a transaction within a transaction')) {
+    return {
+      kind: 'GenericDatabaseError',
+      message: errorMessage,
     }
   }
 
   return {
     kind: 'GenericDatabaseError',
-    message: error.message,
+    message: errorMessage,
   }
 }
 
@@ -156,7 +173,7 @@ function mapRow(row: unknown[], columnTypes: ColumnTypeEnum[]): unknown[] {
 }
 
 /**
- * wa-sqlite Queryable implementation
+ * wa-sqlite Queryable implementation - Base class for query execution
  */
 class WaSQLiteQueryable implements SqlQueryable {
   readonly provider = 'sqlite'
@@ -212,9 +229,6 @@ class WaSQLiteQueryable implements SqlQueryable {
 
   protected async performIO(query: SqlQuery, executeRaw = false): Promise<[string[], unknown[][]] | number> {
     const { sqlite3, db } = this.adapter
-
-    console.log('[performIO] SQL:', query.sql)
-    console.log('[performIO] Args:', query.args)
 
     try {
       // Clean arguments
@@ -359,19 +373,20 @@ class WaSQLiteQueryable implements SqlQueryable {
 class WaSQLiteTransaction extends WaSQLiteQueryable implements Transaction {
   constructor(
     adapter: WaSQLiteAdapter, 
-    readonly options: TransactionOptions
+    readonly options: TransactionOptions,
+    private readonly parentAdapter: PrismaWaSQLiteAdapter
   ) {
     super(adapter)
   }
 
   async commit(): Promise<void> {
     debug(`[js::commit]`)
-    // Commit handled by adapter
+    await this.parentAdapter.commitTransaction()
   }
 
   async rollback(): Promise<void> {
     debug(`[js::rollback]`)
-    // Rollback handled by adapter
+    await this.parentAdapter.rollbackTransaction()
   }
 }
 
@@ -387,8 +402,9 @@ export class PrismaWaSQLiteAdapter extends WaSQLiteQueryable implements SqlDrive
     query: '[prisma:query]',
   }
   
+  private inTransaction = false
   private transactionDepth = 0
-  private activeTransaction: WaSQLiteTransaction | null = null
+  private currentTransaction: WaSQLiteTransaction | null = null
 
   constructor(adapter: WaSQLiteAdapter, private readonly release?: () => Promise<void>) {
     super(adapter)
@@ -425,96 +441,113 @@ export class PrismaWaSQLiteAdapter extends WaSQLiteQueryable implements SqlDrive
     }
 
     const tag = '[js::startTransaction]'
-    debug('%s depth: %d, options: %O', tag, this.transactionDepth, options)
+    debug('%s inTransaction: %s, depth: %d', tag, this.inTransaction, this.transactionDepth)
 
     const { sqlite3, db } = this.adapter
     
-    // Simple transaction handling - Prisma will manage nested transactions
-    if (this.transactionDepth === 0) {
-      try {
-        await sqlite3.exec(db, 'BEGIN')
-        this.transactionDepth = 1
-      } catch (error: any) {
-        // If BEGIN fails, it might be because a transaction is already active
-        // This can happen with Prisma's transaction management
-        if (!error?.message?.includes('cannot start a transaction within a transaction')) {
-          throw error
-        }
-        this.transactionDepth = 1
-      }
+    if (!this.inTransaction) {
+      // Start a new transaction
+      await sqlite3.exec(db, 'BEGIN')
+      this.inTransaction = true
+      this.transactionDepth = 1
+      debug('%s Started new transaction', tag)
     } else {
       // Nested transaction - use savepoint
       this.transactionDepth++
-      const savepointName = `sp_${this.transactionDepth}`
-      try {
-        await sqlite3.exec(db, `SAVEPOINT ${savepointName}`)
-      } catch (error: any) {
-        console.warn(`Failed to create savepoint ${savepointName}:`, error)
-      }
+      const savepointName = `prisma_savepoint_${this.transactionDepth}`
+      await sqlite3.exec(db, `SAVEPOINT ${savepointName}`)
+      debug('%s Created savepoint: %s', tag, savepointName)
     }
     
-    const currentDepth = this.transactionDepth
-    const tx = new WaSQLiteTransaction(this.adapter, options)
-    
-    // Override commit and rollback
-    tx.commit = async () => {
-      debug(`${tag} Committing at depth ${currentDepth}`)
-      if (currentDepth === 1) {
-        try {
-          await sqlite3.exec(db, 'COMMIT')
-        } catch (error: any) {
-          if (!error?.message?.includes('no transaction is active')) {
-            throw error
-          }
-        }
-        this.transactionDepth = 0
-      } else if (currentDepth > 1) {
-        const savepointName = `sp_${currentDepth}`
-        try {
-          await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
-        } catch (error: any) {
-          console.warn(`Failed to release savepoint ${savepointName}:`, error)
-        }
-        this.transactionDepth--
-      }
-    }
-    
-    tx.rollback = async () => {
-      debug(`${tag} Rolling back at depth ${currentDepth}`)
-      if (currentDepth === 1) {
-        try {
-          await sqlite3.exec(db, 'ROLLBACK')
-        } catch (error: any) {
-          if (!error?.message?.includes('no transaction is active')) {
-            throw error
-          }
-        }
-        this.transactionDepth = 0
-      } else if (currentDepth > 1) {
-        const savepointName = `sp_${currentDepth}`
-        try {
-          await sqlite3.exec(db, `ROLLBACK TO SAVEPOINT ${savepointName}`)
-          await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
-        } catch (error: any) {
-          console.warn(`Failed to rollback savepoint ${savepointName}:`, error)
-        }
-        this.transactionDepth--
-      }
-    }
-    
-    this.activeTransaction = tx
+    // Create and return the transaction object
+    const tx = new WaSQLiteTransaction(this.adapter, options, this)
+    this.currentTransaction = tx
     return tx
+  }
+
+  async commitTransaction(): Promise<void> {
+    const tag = '[js::commitTransaction]'
+    debug('%s depth: %d', tag, this.transactionDepth)
+    
+    const { sqlite3, db } = this.adapter
+    
+    if (this.transactionDepth === 1) {
+      // Commit the main transaction
+      try {
+        await sqlite3.exec(db, 'COMMIT')
+        this.inTransaction = false
+        this.transactionDepth = 0
+        debug('%s Committed main transaction', tag)
+      } catch (error: any) {
+        // If commit fails but there's no transaction, that's OK
+        if (!error?.message?.includes('no transaction is active')) {
+          throw error
+        }
+        this.inTransaction = false
+        this.transactionDepth = 0
+      }
+    } else if (this.transactionDepth > 1) {
+      // Release the savepoint
+      const savepointName = `prisma_savepoint_${this.transactionDepth}`
+      try {
+        await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
+        this.transactionDepth--
+        debug('%s Released savepoint: %s', tag, savepointName)
+      } catch (error: any) {
+        // If the savepoint doesn't exist, that might be OK
+        console.warn(`Failed to release savepoint ${savepointName}:`, error)
+        this.transactionDepth--
+      }
+    }
+  }
+
+  async rollbackTransaction(): Promise<void> {
+    const tag = '[js::rollbackTransaction]'
+    debug('%s depth: %d', tag, this.transactionDepth)
+    
+    const { sqlite3, db } = this.adapter
+    
+    if (this.transactionDepth === 1) {
+      // Rollback the main transaction
+      try {
+        await sqlite3.exec(db, 'ROLLBACK')
+        this.inTransaction = false
+        this.transactionDepth = 0
+        debug('%s Rolled back main transaction', tag)
+      } catch (error: any) {
+        // If rollback fails but there's no transaction, that's OK
+        if (!error?.message?.includes('no transaction is active')) {
+          throw error
+        }
+        this.inTransaction = false
+        this.transactionDepth = 0
+      }
+    } else if (this.transactionDepth > 1) {
+      // Rollback to and release the savepoint
+      const savepointName = `prisma_savepoint_${this.transactionDepth}`
+      try {
+        await sqlite3.exec(db, `ROLLBACK TO SAVEPOINT ${savepointName}`)
+        await sqlite3.exec(db, `RELEASE SAVEPOINT ${savepointName}`)
+        this.transactionDepth--
+        debug('%s Rolled back to savepoint: %s', tag, savepointName)
+      } catch (error: any) {
+        // If the savepoint doesn't exist, that might be OK
+        console.warn(`Failed to rollback savepoint ${savepointName}:`, error)
+        this.transactionDepth--
+      }
+    }
   }
 
   async dispose(): Promise<void> {
     // Ensure any open transaction is rolled back
-    if (this.transactionDepth > 0) {
+    if (this.inTransaction) {
       const { sqlite3, db } = this.adapter
       try {
         await sqlite3.exec(db, 'ROLLBACK')
       } catch (error) {
         // Ignore errors during cleanup
       }
+      this.inTransaction = false
       this.transactionDepth = 0
     }
     
@@ -533,7 +566,7 @@ export class PrismaWaSQLiteAdapterFactory implements SqlDriverAdapterFactory {
   constructor(private adapter: WaSQLiteAdapter) {}
 
   async connect(): Promise<SqlDriverAdapter> {
-    // Return the same adapter instance to maintain transaction state
+    // Always return the same adapter instance to maintain state
     if (!this.adapterInstance) {
       this.adapterInstance = new PrismaWaSQLiteAdapter(this.adapter, async () => {
         // Cleanup if needed
@@ -571,7 +604,6 @@ export const createWaSQLitePrismaAdapter = async (
 
     options?.logger?.('Opening database...')
     // Open database - use in-memory database for browser
-    // wa-sqlite returns the db handle directly, not wrapped in a promise
     const db = await sqlite3.open_v2(':memory:')
 
     if (!db || db === 0) {
@@ -583,8 +615,13 @@ export const createWaSQLitePrismaAdapter = async (
     // Set pragmas for better performance and compatibility
     try {
       await sqlite3.exec(db, 'PRAGMA foreign_keys = ON')
-      // WAL mode is not supported in memory databases
-      // await sqlite3.exec(db, 'PRAGMA journal_mode = WAL')
+      // WAL mode is not supported in memory databases, but we can try
+      try {
+        await sqlite3.exec(db, 'PRAGMA journal_mode = WAL')
+      } catch (e) {
+        // Fallback to default journal mode
+        debug('WAL mode not supported, using default journal mode')
+      }
       options?.logger?.('Foreign keys enabled')
     } catch (e) {
       console.warn('[wa-sqlite] Failed to set pragmas:', e)

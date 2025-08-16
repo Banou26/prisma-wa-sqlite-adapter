@@ -3,7 +3,11 @@
     "allow": [
       "Bash(npm test)",
       "Bash(npm run test-server:*)",
-      "Bash(npm run build-test:*)"
+      "Bash(npm run build-test:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(npm install:*)"
     ],
     "deny": [],
     "ask": []
