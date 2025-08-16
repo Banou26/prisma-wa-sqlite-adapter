@@ -6,16 +6,16 @@ use(chaiAsPromised)
 use(chaiShallowDeepEqual)
 
 export const importPrismaClient = async () => {
-  await expect(import('../src/prisma')).to.be.fulfilled
+  await expect(import('../src/prisma-better-sqlite3')).to.be.fulfilled
 }
 
 export const count = async () => {
-  const { default: client } = await import('../src/prisma')
+  const { default: client } = await import('../src/prisma-better-sqlite3')
   await expect(client.foo.count()).to.eventually.equal(0)
 }
 
 export const create = async () => {
-  const { default: client } = await import('../src/prisma')
+  const { default: client } = await import('../src/prisma-better-sqlite3')
 
   const id = crypto.randomUUID()
   const createdFoo = await client.foo.create({
@@ -31,7 +31,7 @@ export const create = async () => {
 
 
 export const createWithRelations = async () => {
-  const { default: client } = await import('../src/prisma')
+  const { default: client } = await import('../src/prisma-better-sqlite3')
 
   const id = crypto.randomUUID()
   const barId = crypto.randomUUID()
