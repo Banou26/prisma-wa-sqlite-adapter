@@ -94,23 +94,32 @@ class WASqliteQueryable<ClientT extends WASqliteContext> implements SqlQueryable
     try {
       const params = query.args.map((arg, i) => mapArg(arg, query.argTypes[i]))
       let currentIndex = 0
+      const results: { [key: string]: SQLiteCompatibleType }[] = []
       for await (const stmt of this.context.sqlite3.statements(this.context.database, query.sql)) {
-        const paramsCount = this.context.sqlite3.bind_parameter_count(stmt)
-        this.context.sqlite3.bind_collection(stmt, params.slice(currentIndex, paramsCount))
-        currentIndex = currentIndex + paramsCount
-        // Execute the statement with this loop.
+        const paramCount = this.context.sqlite3.bind_parameter_count(stmt)
+        this.context.sqlite3.bind_collection(stmt, params.slice(currentIndex, paramCount))
+        currentIndex = currentIndex + paramCount
         while (await this.context.sqlite3.step(stmt) === SQLite.SQLITE_ROW) {
-          // Collect row data here.
+          const columnCount = this.context.sqlite3.column_count(stmt)
+          const columnNames = this.context.sqlite3.column_names(stmt)
+          const columnValues =
+            Array(columnCount)
+              .fill(undefined)
+              .map((_, i) => this.context.sqlite3.column(stmt, i))
+          const record =
+            Object.fromEntries(
+              columnNames.map((name, i) => {
+                if (columnValues[i] === undefined) throw new Error(`No value found for column ${name}`)
+                return [
+                  name,
+                  columnValues[i]
+                ]
+              })
+            )
+          results.push(record)
+
+          return [columnNames, ...columnValues]
         }
-
-        // Change bindings, reset, and execute again if desired.
-      }
-
-      if (executeRaw) {
-        return await stmt.run()
-      } else {
-        const [columnNames, ...rows] = await stmt.raw({ columnNames: true })
-        return [columnNames, rows]
       }
     } catch (e) {
       onError(e as Error)
