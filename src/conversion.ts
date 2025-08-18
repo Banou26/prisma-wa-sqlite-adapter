@@ -49,7 +49,7 @@ export function getColumnTypes(columnNames: string[], rows: unknown[][]): Column
  *
  * ² - Booleans will be cast to an INTEGER type where 1 is TRUE and 0 is FALSE.
  */
-function inferColumnType(value: NonNullable<Value>): ColumnType {
+export function inferColumnType(value: NonNullable<Value>): ColumnType {
   switch (typeof value) {
     case 'string':
       return inferStringType(value)

@@ -13,21 +13,26 @@ import {
 } from '@prisma/driver-adapter-utils'
 import SQLiteESMFactory from 'wa-sqlite/dist/wa-sqlite.mjs'
 import * as SQLite from 'wa-sqlite'
+import { Mutex } from 'async-mutex'
 
 // @ts-expect-error
 import { name as packageName } from '../package.json'
 import { MAX_BIND_VALUES } from './constants'
-import { getColumnTypes, mapArg, mapRow } from './conversion'
+import { getColumnTypes, inferColumnType, mapArg, mapRow } from './conversion'
 import { convertDriverError } from './errors'
 
 const debug = Debug('prisma:driver-adapter:d1')
 
-type D1ResultsWithColumnNames = [string[], unknown[][]]
-type PerformIOResult = D1ResultsWithColumnNames
+const LOCK_TAG = Symbol()
+
 type WASqliteContext = {
   module: any
   sqlite3: SQLiteAPI
   database: number
+}
+
+type ExtendedSqlResultSet = SqlResultSet & {
+  changes: number
 }
 
 /**
@@ -35,7 +40,9 @@ type WASqliteContext = {
  */
 class WASqliteQueryable<ClientT extends WASqliteContext> implements SqlQueryable {
   readonly provider = 'sqlite'
-  readonly adapterName = packageName
+  readonly adapterName = packageName;
+
+  [LOCK_TAG] = new Mutex()
 
   constructor(protected readonly context: ClientT) {}
 
@@ -47,34 +54,7 @@ class WASqliteQueryable<ClientT extends WASqliteContext> implements SqlQueryable
     debug(`${tag} %O`, query)
 
     const data = await this.performIO(query)
-    const convertedData = this.convertData(data as D1ResultsWithColumnNames)
-    return convertedData
-  }
-
-  private convertData(ioResult: D1ResultsWithColumnNames): SqlResultSet {
-    const columnNames = ioResult[0]
-    const results = ioResult[1]
-
-    if (results.length === 0) {
-      return {
-        columnNames: [],
-        columnTypes: [],
-        rows: [],
-      }
-    }
-
-    const columnTypes = Object.values(getColumnTypes(columnNames, results))
-    const rows = results.map((value) => mapRow(value, columnTypes))
-
-    return {
-      columnNames,
-      // * Note: without Object.values the array looks like
-      // * columnTypes: [ id: 128 ],
-      // * and errors with:
-      // * ✘ [ERROR] A hanging Promise was canceled. This happens when the worker runtime is waiting for a Promise from JavaScript to resolve, but has detected that the Promise cannot possibly ever resolve because all code and events related to the Promise's I/O context have already finished.
-      columnTypes,
-      rows,
-    }
+    return data
   }
 
   /**
@@ -86,43 +66,50 @@ class WASqliteQueryable<ClientT extends WASqliteContext> implements SqlQueryable
     const tag = '[js::execute_raw]'
     debug(`${tag} %O`, query)
 
-    const result = await this.performIO(query, true)
-    return (result as D1Response).meta.changes ?? 0
+    const result = await this.performIO(query)
+    return result.changes ?? 0
   }
 
-  private async performIO(query: SqlQuery, executeRaw = false): Promise<PerformIOResult> {
+  private async performIO(query: SqlQuery): Promise<ExtendedSqlResultSet> {
+    console.log('query', query)
     try {
       const params = query.args.map((arg, i) => mapArg(arg, query.argTypes[i]))
       let currentIndex = 0
-      const results: { [key: string]: SQLiteCompatibleType }[] = []
       for await (const stmt of this.context.sqlite3.statements(this.context.database, query.sql)) {
+        console.log('stmt', this.context.sqlite3.sql(stmt))
         const paramCount = this.context.sqlite3.bind_parameter_count(stmt)
+        // const columnCount = this.context.sqlite3.column_count(stmt)
+        const columnNames = this.context.sqlite3.column_names(stmt)
+        const columnTypes =
+          Array(paramCount)
+            .fill(undefined)
+            .map((_, i) => inferColumnType(this.context.sqlite3.column_type(stmt, i)))
         this.context.sqlite3.bind_collection(stmt, params.slice(currentIndex, paramCount))
         currentIndex = currentIndex + paramCount
+        const rows = [] as SQLiteCompatibleType[][]
         while (await this.context.sqlite3.step(stmt) === SQLite.SQLITE_ROW) {
-          const columnCount = this.context.sqlite3.column_count(stmt)
-          const columnNames = this.context.sqlite3.column_names(stmt)
-          const columnValues =
-            Array(columnCount)
-              .fill(undefined)
-              .map((_, i) => this.context.sqlite3.column(stmt, i))
-          const record =
-            Object.fromEntries(
-              columnNames.map((name, i) => {
-                if (columnValues[i] === undefined) throw new Error(`No value found for column ${name}`)
-                return [
-                  name,
-                  columnValues[i]
-                ]
-              })
-            )
-          results.push(record)
-
-          return [columnNames, ...columnValues]
+          const row = this.context.sqlite3.row(stmt)
+          rows.push(row)
+        }
+        const changes = this.context.sqlite3.changes(this.context.database)
+        if (changes) {
+          return {
+            columnNames,
+            columnTypes,
+            rows,
+            changes
+          }
         }
       }
-    } catch (e) {
-      onError(e as Error)
+      return {
+        columnNames: [],
+        columnTypes: [],
+        rows: [],
+        changes: 0
+      }
+    } catch (error) {
+      console.error('Error in performIO: %O', error)
+      throw new DriverAdapterError(convertDriverError(error))
     }
   }
 }
@@ -169,7 +156,8 @@ export class PrismaWASqliteAdapter extends WASqliteQueryable<WASqliteContext> im
     try {
       await this.context.sqlite3.exec(this.context.database, script)
     } catch (error) {
-      onError(error as Error)
+      console.error('Error in performIO: %O', error)
+      throw new DriverAdapterError(convertDriverError(error))
     }
   }
 
@@ -222,9 +210,4 @@ export class PrismaWASqliteAdapterFactory implements SqlDriverAdapterFactory {
     const database = await sqlite3.open_v2(':memory:')
     return new PrismaWASqliteAdapter({ module, sqlite3, database }, async () => {})
   }
-}
-
-function onError(error: Error): never {
-  console.error('Error in performIO: %O', error)
-  throw new DriverAdapterError(convertDriverError(error))
 }
